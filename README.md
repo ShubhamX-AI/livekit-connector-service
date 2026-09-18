@@ -82,7 +82,7 @@ curl -X POST http://127.0.0.1:8080/meetings/join \
   }'
 ```
 
-The control backend uses `CORE_API_URL` and `CORE_API_KEY` to call the core API. The core API key
+The control backend uses `VOICEKIT_API_URL` and `VOICEKIT_API_KEY` to call the core API. The core API key
 must be valid for the assistant owner.
 
 ## Docker
@@ -96,7 +96,7 @@ docker compose up --build control
 
 The control backend is published on `http://127.0.0.1:8080`; its health endpoint is
 `/health`. Docker services reach LiveKit and the core API on the host through
-`host.docker.internal`. Override `DOCKER_LIVEKIT_URL` or `DOCKER_CORE_API_URL` when those
+`host.docker.internal`. Override `DOCKER_LIVEKIT_URL` or `DOCKER_VOICEKIT_API_URL` when those
 services run at different addresses.
 
 Chrome uses Xvfb and needs the configured shared-memory allocation. Failed joins write screenshots,

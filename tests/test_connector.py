@@ -146,7 +146,7 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
             assistant_id="assistant-id",
             meeting_url="https://meet.google.com/test",
         )
-        with environment(CORE_API_URL="http://core", CORE_API_KEY="core-key"):
+        with environment(VOICEKIT_API_URL="http://core", VOICEKIT_API_KEY="core-key"):
             with patch("standalone_google_meet.api.control.httpx.AsyncClient", FakeHttpClient):
                 response = await control.join_meeting(request)
 

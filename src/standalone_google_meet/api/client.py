@@ -14,10 +14,10 @@ class CoreApiSettings:
 
     @classmethod
     def from_environment(cls) -> "CoreApiSettings":
-        base_url = os.environ.get("CORE_API_URL")
-        api_key = os.environ.get("CORE_API_KEY")
+        base_url = os.environ.get("VOICEKIT_API_URL")
+        api_key = os.environ.get("VOICEKIT_API_KEY")
         if not base_url or not api_key:
-            raise ValueError("CORE_API_URL and CORE_API_KEY are required")
+            raise ValueError("VOICEKIT_API_URL and VOICEKIT_API_KEY are required")
         return cls(base_url=base_url.rstrip("/"), api_key=api_key)
 
 

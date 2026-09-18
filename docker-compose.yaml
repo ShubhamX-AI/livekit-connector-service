@@ -1,25 +1,33 @@
-x-connector-environment: &connector-environment
-  LIVEKIT_URL: ${DOCKER_LIVEKIT_URL:-ws://host.docker.internal:7880}
-  CORE_API_URL: ${DOCKER_CORE_API_URL:-http://host.docker.internal:8001}
-
 services:
   worker:
     build: .
     env_file: .env
-    environment: *connector-environment
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     shm_size: 2gb
+    restart: unless-stopped
     volumes:
       - ./artifacts:/app/artifacts
     command: ["python3", "-m", "livekit.agents", "start", "agent_run.py"]
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+        reservations:
+          cpus: "0.5"
+          memory: 512m
 
   control:
     build: .
     env_file: .env
-    environment: *connector-environment
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
     ports:
       - "${CONTROL_PORT:-8080}:8080"
     command: ["python3", "control_run.py"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1g
+        reservations:
+          cpus: "0.25"
+          memory: 256m
