@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         xvfb \
         xauth \
+        xclip \
+        x11-utils \
         x11-xkb-utils \
         fonts-liberation \
         libvulkan1 \

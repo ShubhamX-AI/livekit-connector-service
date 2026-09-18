@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,6 +21,15 @@ class ConnectorConfig:
     websocket_port: int = 8765
     chrome_driver_path: str = "/usr/local/bin/chromedriver"
     headless: bool = False
+    # "humanized" drives the join UI with real X11 pointer and keyboard input, which is what
+    # gets an anonymous bot past Google's "You can't join this video call" screen. "robotic"
+    # uses WebDriver clicks and only works for a signed-in browser profile.
+    ui_interaction_mode: str = "humanized"
+    video_frame_width: int = 1280
+    video_frame_height: int = 720
+    join_attempts: int = 3
+    waiting_room_timeout_seconds: int = 300
+    artifact_dir: str = "/app/artifacts"
 
     @classmethod
     def from_environment(cls) -> "ConnectorConfig":
@@ -37,10 +47,18 @@ class ConnectorConfig:
             "websocket_port": int(os.environ.get("CONNECTOR_WEBSOCKET_PORT", "8765")),
             "chrome_driver_path": os.environ.get("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver"),
             "headless": os.environ.get("CHROME_HEADLESS", "false").lower() == "true",
+            "ui_interaction_mode": os.environ.get("UI_INTERACTION_MODE", "humanized"),
+            "video_frame_width": int(os.environ.get("VIDEO_FRAME_WIDTH", "1280")),
+            "video_frame_height": int(os.environ.get("VIDEO_FRAME_HEIGHT", "720")),
+            "join_attempts": int(os.environ.get("JOIN_ATTEMPTS", "3")),
+            "waiting_room_timeout_seconds": int(os.environ.get("WAITING_ROOM_TIMEOUT_SECONDS", "300")),
+            "artifact_dir": os.environ.get("ARTIFACT_DIR", "/app/artifacts"),
         }
         missing = [name.upper() for name in ("meeting_url", "livekit_url", "livekit_api_key", "livekit_api_secret", "livekit_room") if not values[name]]
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+        if values["ui_interaction_mode"] not in ("humanized", "robotic"):
+            raise ValueError("UI_INTERACTION_MODE must be 'humanized' or 'robotic'")
         if values["source_identity"] and values["source_publish_on_behalf"]:
             raise ValueError("Set only one of LIVEKIT_SOURCE_IDENTITY or LIVEKIT_SOURCE_PUBLISH_ON_BEHALF")
         if values["sample_rate"] <= 0:

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pyvirtualdisplay import Display
@@ -12,18 +13,38 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from .config import ConnectorConfig
+from .humanized_input import HumanizedInput
 from .websocket_server import BrowserWebSocketServer
 
 logger = logging.getLogger(__name__)
 ASSET_DIR = Path(__file__).resolve().parents[2] / "assets"
-JOIN_ATTEMPTS = 3
 JOIN_RETRY_DELAY_SECONDS = 5
-JOIN_BLOCK_CHECK_SECONDS = 8
+ADMISSION_POLL_SECONDS = 2
 BLOCKED_TEXTS = ("You can't join this video call", "There is a problem connecting to this video call")
+DENIED_TEXTS = (
+    "Someone in the call denied your request to join",
+    "Someone on the call denied your request to join",
+    "Someone in the call has denied your request to join",
+    "Someone on the call has denied your request to join",
+    "No one responded to your request to join the call",
+    "No one has responded to your request to join the call",
+    "You left the meeting",
+)
+WAITING_ROOM_TEXT = "Asking to be let in"
+LEAVE_CALL_SELECTOR = 'button[aria-label="Leave call"]'
+JOIN_BUTTON_XPATH = '//button[.//span[text()="Ask to join" or text()="Ask to join anyway" or text()="Join now" or text()="Join the call now" or text()="Join anyway" or text()="Join here too"]]'
 
 
 class GoogleBlockingJoinError(RuntimeError):
     """Google rejected the join attempt with its generic block screen."""
+
+
+class JoinRequestDeniedError(RuntimeError):
+    """Someone in the call denied the join request, or nobody answered it."""
+
+
+class WaitingRoomTimeoutError(RuntimeError):
+    """Nobody admitted the bot before the waiting-room timeout expired."""
 
 
 class GoogleMeetChromeSession:
@@ -32,6 +53,7 @@ class GoogleMeetChromeSession:
         self.livekit_sync = livekit_sync
         self.display = None
         self.driver = None
+        self.humanized_input = None
         self.websocket_server = BrowserWebSocketServer(
             host=config.websocket_host,
             port=config.websocket_port,
@@ -39,10 +61,13 @@ class GoogleMeetChromeSession:
             upstream_livekit_url=config.livekit_url,
         )
 
+    @property
+    def humanized(self):
+        return self.config.ui_interaction_mode == "humanized"
+
     def start(self):
         self._start_display()
         self.websocket_server.start()
-        self._start_driver()
         self._join_meeting()
 
     def _start_display(self):
@@ -56,13 +81,15 @@ class GoogleMeetChromeSession:
         options.add_argument("--autoplay-policy=no-user-gesture-required")
         options.add_argument("--use-fake-device-for-media-stream")
         options.add_argument("--use-fake-ui-for-media-stream")
-        options.add_argument("--window-size=1280,720")
+        options.add_argument(f"--window-size={self.config.video_frame_width},{self.config.video_frame_height}")
         options.add_argument("--start-fullscreen")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-extensions")
+        options.add_argument("--disable-application-cache")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("prefs", {"credentials_enable_service": False, "profile.password_manager_enabled": False})
         if self.config.headless:
             options.add_argument("--headless=new")
         if os.environ.get("ENABLE_CHROME_SANDBOX", "false").lower() != "true":
@@ -71,12 +98,23 @@ class GoogleMeetChromeSession:
 
         self.driver = webdriver.Chrome(options=options, service=Service(executable_path=self.config.chrome_driver_path))
         self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": self._browser_script()})
+        self.humanized_input = HumanizedInput(self.driver, video_frame_size=(self.config.video_frame_width, self.config.video_frame_height)) if self.humanized else None
+
+    def _quit_driver(self):
+        self.humanized_input = None
+        if not self.driver:
+            return
+        try:
+            self.driver.quit()
+        except Exception:
+            logger.exception("Failed to close Chrome")
+        self.driver = None
 
     def _browser_script(self):
         initial_data = {
             "websocketPort": self.config.websocket_port,
-            "videoFrameWidth": 1280,
-            "videoFrameHeight": 720,
+            "videoFrameWidth": self.config.video_frame_width,
+            "videoFrameHeight": self.config.video_frame_height,
             "botName": self.config.bot_display_name,
             "addClickRipple": False,
             "recordingView": "speaker_view",
@@ -97,50 +135,96 @@ class GoogleMeetChromeSession:
         return "\n".join(script_parts)
 
     def _join_meeting(self):
-        # Google sometimes rejects an anonymous join with "You can't join this video call"
-        # right after the join click. That block is often transient, so retry the whole
-        # join flow a few times before giving up.
+        # Google sometimes rejects a join with "You can't join this video call". That block is
+        # often tied to the browser session, so every attempt gets a fresh Chrome rather than
+        # reloading the URL in the session Google already rejected.
+        attempts = self.config.join_attempts
         last_error = None
-        for attempt in range(1, JOIN_ATTEMPTS + 1):
-            logger.info("Opening Google Meet (attempt %s/%s): %s", attempt, JOIN_ATTEMPTS, self.config.meeting_url)
+        for attempt in range(1, attempts + 1):
+            logger.info("Opening Google Meet (attempt %s/%s): %s", attempt, attempts, self.config.meeting_url)
             try:
+                self._start_driver()
                 self._attempt_join()
-                logger.info("Google Meet join requested")
+                logger.info("Google Meet join succeeded")
                 return
-            except GoogleBlockingJoinError as error:
+            except (GoogleBlockingJoinError, JoinRequestDeniedError, WaitingRoomTimeoutError) as error:
                 last_error = error
-                logger.warning("Google blocked the join attempt: %s", error)
-                if attempt < JOIN_ATTEMPTS:
+                logger.warning("Join attempt %s failed: %s: %s", attempt, type(error).__name__, error)
+                self._save_artifacts(f"attempt-{attempt}-{type(error).__name__}")
+                self._quit_driver()
+                if isinstance(error, GoogleBlockingJoinError) and attempt < attempts:
                     time.sleep(JOIN_RETRY_DELAY_SECONDS * attempt)
-        raise RuntimeError(f"Google blocked every join attempt ({JOIN_ATTEMPTS}). Joining as a signed-in Google account usually avoids this.") from last_error
+                    continue
+                raise
+            except Exception as error:
+                last_error = error
+                logger.exception("Join attempt %s raised an unexpected error", attempt)
+                self._save_artifacts(f"attempt-{attempt}-{type(error).__name__}")
+                self._quit_driver()
+                if attempt < attempts:
+                    time.sleep(JOIN_RETRY_DELAY_SECONDS * attempt)
+                    continue
+                raise
+        raise RuntimeError(f"Google blocked every join attempt ({attempts}). Joining as a signed-in Google account usually avoids this.") from last_error
 
     def _attempt_join(self):
+        if self.humanized_input:
+            self.humanized_input.position_mouse()
         self.driver.get(self.config.meeting_url)
         self.driver.execute_cdp_cmd("Browser.grantPermissions", {"origin": self.config.meeting_url, "permissions": ["audioCapture", "videoCapture"]})
         self._reject_invalid_meeting()
         self._raise_if_blocked()
         self._fill_name()
         self._turn_off_media()
-        join_button = WebDriverWait(self.driver, 60).until(
-            EC.presence_of_element_located((By.XPATH, '//button[.//span[text()="Ask to join" or text()="Ask to join anyway" or text()="Join now" or text()="Join the call now" or text()="Join anyway" or text()="Join here too"]]'))
-        )
-        join_button.click()
-        self._wait_until_join_accepted()
+        join_button = WebDriverWait(self.driver, 60).until(EC.presence_of_element_located((By.XPATH, JOIN_BUTTON_XPATH)))
+        logger.info("Clicking the join button")
+        if self.humanized_input:
+            self.humanized_input.click_element(join_button)
+        else:
+            join_button.click()
+        self._wait_until_admitted()
         self.driver.execute_script("window.ws?.enableMediaSending();")
+        logger.info("Media sending enabled")
 
-    def _wait_until_join_accepted(self):
-        # The block screen shows up within a few seconds of the click. Anything else means the
-        # request went through and the bot is either in the call or in the waiting room.
-        deadline = time.monotonic() + JOIN_BLOCK_CHECK_SECONDS
+    def _wait_until_admitted(self):
+        """Block until the bot is actually in the call.
+
+        A block screen shows up within a few seconds of the click. Otherwise the bot is
+        either already in the call or sitting in the waiting room until someone admits it.
+        Media sending must not start before this returns, or the bot publishes audio while
+        it is still in the waiting room.
+        """
+        deadline = time.monotonic() + self.config.waiting_room_timeout_seconds
+        logged_waiting = False
         while time.monotonic() < deadline:
             self._raise_if_blocked()
-            time.sleep(1)
+            self._raise_if_denied()
+            if self._is_in_call():
+                logger.info("Bot is in the call")
+                return
+            if not logged_waiting and self._page_contains(WAITING_ROOM_TEXT):
+                logger.info("Waiting to be admitted (timeout %ss)", self.config.waiting_room_timeout_seconds)
+                logged_waiting = True
+            time.sleep(ADMISSION_POLL_SECONDS)
+        raise WaitingRoomTimeoutError(f"Not admitted within {self.config.waiting_room_timeout_seconds}s")
+
+    def _is_in_call(self):
+        return bool(self.driver.find_elements(By.CSS_SELECTOR, LEAVE_CALL_SELECTOR))
+
+    def _page_contains(self, text):
+        return bool(self._visible_elements_containing((text,)))
+
+    def _visible_elements_containing(self, texts):
+        xpath = "//*[" + " or ".join(f'contains(text(), "{text}")' for text in texts) + "]"
+        return [element for element in self.driver.find_elements(By.XPATH, xpath) if element.is_displayed()]
 
     def _raise_if_blocked(self):
-        elements = self.driver.find_elements(By.XPATH, "//*[" + " or ".join(f'contains(text(), "{text}")' for text in BLOCKED_TEXTS) + "]")
-        for element in elements:
-            if element.is_displayed():
-                raise GoogleBlockingJoinError(element.text.strip().splitlines()[0])
+        for element in self._visible_elements_containing(BLOCKED_TEXTS):
+            raise GoogleBlockingJoinError(element.text.strip().splitlines()[0])
+
+    def _raise_if_denied(self):
+        for element in self._visible_elements_containing(DENIED_TEXTS):
+            raise JoinRequestDeniedError(element.text.strip().splitlines()[0])
 
     def _reject_invalid_meeting(self):
         invalid_texts = ("Check your meeting code", "Invalid video call name", "Your meeting code has expired")
@@ -151,24 +235,50 @@ class GoogleMeetChromeSession:
     def _fill_name(self):
         try:
             name_input = WebDriverWait(self.driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="text"][aria-label="Your name"]')))
-            name_input.send_keys(self.config.bot_display_name)
         except Exception:
             logger.info("Google Meet did not show an anonymous name input; continuing as signed-in/known user")
+            return
+        if self.humanized_input:
+            self.humanized_input.click_element(name_input)
+            self.humanized_input.copy_and_paste(self.config.bot_display_name)
+        else:
+            name_input.send_keys(self.config.bot_display_name)
+        logger.info("Name input filled out")
 
     def _turn_off_media(self):
         for label in ("Turn off microphone", "Turn off camera"):
             try:
                 button = WebDriverWait(self.driver, 15).until(EC.element_to_be_clickable((By.CSS_SELECTOR, f'button[aria-label="{label}"], div[aria-label="{label}"]')))
-                button.click()
             except Exception:
                 logger.debug("Media control not available: %s", label)
+                continue
+            if self.humanized_input:
+                self.humanized_input.click_element(button)
+            else:
+                button.click()
+
+    def _save_artifacts(self, label):
+        """Persist a screenshot, the DOM and the URL so a failed join can be diagnosed."""
+        if not self.driver:
+            return
+        directory = Path(self.config.artifact_dir)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        prefix = f"{stamp}-{label}"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            self.driver.save_screenshot(str(directory / f"{prefix}.png"))
+            (directory / f"{prefix}.html").write_text(self.driver.page_source, encoding="utf-8")
+            (directory / f"{prefix}.url.txt").write_text(self.driver.current_url, encoding="utf-8")
+            logger.info("Saved failure artifacts to %s", directory / prefix)
+        except Exception:
+            logger.exception("Failed to save failure artifacts")
 
     def leave(self):
         if not self.driver:
             return
         try:
             self.driver.execute_script("window.ws?.disableMediaSending();")
-            button = WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'button[jsname="CQylAd"][aria-label="Leave call"]')))
+            button = WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, LEAVE_CALL_SELECTOR)))
             button.click()
         except Exception:
             logger.debug("Google Meet leave button unavailable during shutdown")
@@ -177,12 +287,7 @@ class GoogleMeetChromeSession:
         try:
             self.leave()
         finally:
-            if self.driver:
-                try:
-                    self.driver.quit()
-                except Exception:
-                    logger.exception("Failed to close Chrome")
-                self.driver = None
+            self._quit_driver()
             self.websocket_server.close()
             if self.display:
                 self.display.stop()

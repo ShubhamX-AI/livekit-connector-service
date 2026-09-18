@@ -12,6 +12,7 @@ dependencies = [
     "selenium==4.27.1",
     "websockets==14.1",
     "python-dotenv==1.2.3",
+    "python-xlib==0.33",
 ]
 
 [dependency-groups]
