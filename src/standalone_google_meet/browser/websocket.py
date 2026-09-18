@@ -1,22 +1,25 @@
 import logging
 import threading
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 from websockets.sync.server import serve
 
-from standalone_google_meet.protocol import JSON, PER_PARTICIPANT_AUDIO, decode_json, decode_message, decode_participant_audio
+from ..events import ENDED_EVENT
+from .protocol import JSON, MIXED_AUDIO, decode_json, decode_message
 
 logger = logging.getLogger(__name__)
 
 
 class BrowserWebSocketServer:
-    def __init__(self, *, host, port, livekit_sync, upstream_livekit_url):
+    def __init__(self, *, host, port, livekit_sync, upstream_livekit_url, on_status: Callable[[str, str | None], None] | None = None):
         self.host = host
         self.port = port
         self.livekit_sync = livekit_sync
         self.upstream_livekit_url = upstream_livekit_url
+        self.on_status = on_status
         self.server = None
         self.thread = None
         self.started = threading.Event()
@@ -43,9 +46,10 @@ class BrowserWebSocketServer:
                 message_type, payload = decode_message(message)
                 if message_type == JSON:
                     self._handle_json(decode_json(payload))
-                elif message_type == PER_PARTICIPANT_AUDIO:
-                    audio = decode_participant_audio(payload)
-                    self.livekit_sync.send_audio(audio.participant_id, self._float32_to_pcm16(audio.pcm_float32))
+                elif message_type == MIXED_AUDIO:
+                    # Google Meet's own mix of everyone in the call. The payload is bare float32
+                    # with no participant id, because there is no single speaker to name.
+                    self.livekit_sync.send_mixed_audio(self._float32_to_pcm16(payload))
             except Exception:
                 logger.exception("Failed to process browser WebSocket message")
 
@@ -59,11 +63,18 @@ class BrowserWebSocketServer:
         if message_type == "UsersUpdate":
             for participant in message.get("newUsers", []) + message.get("updatedUsers", []):
                 if participant.get("humanized_status") == "in_meeting":
-                    self.livekit_sync.participant_joined(participant["deviceId"], participant.get("fullName"))
+                    logger.info(
+                        "Meet participant joined: %s (%s)",
+                        participant.get("fullName") or participant.get("deviceId"),
+                        participant.get("deviceId"),
+                    )
             for participant in message.get("removedUsers", []):
-                self.livekit_sync.participant_left(participant["deviceId"])
+                logger.info("Meet participant left: %s", participant.get("deviceId"))
         elif message_type == "MeetingStatusChange":
-            logger.info("Google Meet status changed: %s", message.get("change"))
+            change = message.get("change")
+            logger.info("Google Meet status changed: %s", change)
+            if change in {"meeting_ended", "removed_from_meeting"} and self.on_status:
+                self.on_status(ENDED_EVENT, change)
 
     @staticmethod
     def _float32_to_pcm16(raw: bytes) -> bytes:

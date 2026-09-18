@@ -4,5 +4,4 @@ __pycache__
 *.pyc
 .env
 tests
-Dockerfile
 docker-compose.yaml

@@ -51,9 +51,9 @@ WORKDIR /app
 # Dependencies first so that source edits do not invalidate the layer.
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY agent_run.py control_run.py ./
 RUN pip install --no-cache-dir .
 
-COPY assets ./assets
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
@@ -62,4 +62,4 @@ RUN useradd --create-home --uid 1000 app && chown -R app:app /app
 USER app
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["python3", "-m", "standalone_google_meet"]
+CMD ["python3", "-m", "livekit.agents", "start", "agent_run.py"]

@@ -355,7 +355,11 @@ class StyleManager {
 
     startSilenceDetection() {
          // Set up audio context and processing as before
-         this.audioContext = new AudioContext();
+         // Rate is pinned from initialData so the mixed float32 frames match the sample rate the
+         // connector declares to LiveKit. Falling back to the browser default would resample.
+         this.audioContext = new AudioContext(
+             window.initialData.audioSampleRate ? { sampleRate: window.initialData.audioSampleRate } : undefined
+         );
 
          this.audioSources = this.audioTracks.map(track => {
              const mediaStream = new MediaStream([track]);
@@ -1171,7 +1175,6 @@ class WebSocketClient {
       VIDEO: 2,
       AUDIO: 3,
       ENCODED_MP4_CHUNK: 4,
-      PER_PARTICIPANT_AUDIO: 5,
       PER_PARTICIPANT_VIDEO: 6,
   };
 
@@ -1358,44 +1361,6 @@ class WebSocketClient {
       this.ws.send(message);
     } catch (error) {
       console.error('Error sending WebSocket video chunk:', error);
-    }
-  }
-
-  sendPerParticipantAudio(participantId, audioData) {
-    if (this.ws.readyState !== WebSocket.OPEN) {
-      console.error('WebSocket is not connected for per participant audio send', this.ws.readyState);
-      return;
-    }
-
-    if (!this.mediaSendingEnabled) {
-      return;
-    }
-
-    try {
-        // Convert participantId to UTF-8 bytes
-        const participantIdBytes = new TextEncoder().encode(participantId);
-        
-        // Create final message: type (4 bytes) + participantId length (1 byte) + 
-        // participantId bytes + audio data
-        const message = new Uint8Array(4 + 1 + participantIdBytes.length + audioData.buffer.byteLength);
-        const dataView = new DataView(message.buffer);
-        
-        // Set message type (5 for PER_PARTICIPANT_AUDIO)
-        dataView.setInt32(0, WebSocketClient.MESSAGE_TYPES.PER_PARTICIPANT_AUDIO, true);
-        
-        // Set participantId length as uint8 (1 byte)
-        dataView.setUint8(4, participantIdBytes.length);
-        
-        // Copy participantId bytes
-        message.set(participantIdBytes, 5);
-        
-        // Copy audio data after type, length and participantId
-        message.set(new Uint8Array(audioData.buffer), 5 + participantIdBytes.length);
-        
-        // Send the binary message
-        this.ws.send(message.buffer);
-    } catch (error) {
-        console.error('Error sending WebSocket audio message:', error);
     }
   }
 
@@ -1824,7 +1789,7 @@ const receiverManager = new ReceiverManager();
 const chatMessageManager = new ChatMessageManager(ws);
 const participantSpeechStartStopManager = new ParticipantSpeechStartStopManager();
 let rtpReceiverInterceptor = null;
-if (window.initialData.sendPerParticipantAudio || window.initialData.recordParticipantSpeechStartStopEvents) {
+if (window.initialData.recordParticipantSpeechStartStopEvents) {
     rtpReceiverInterceptor = new RTCRtpReceiverInterceptor((receiver, result, ...args) => {
         receiverManager.updateContributingSources(receiver, result);
     });
@@ -2155,30 +2120,6 @@ const handleAudioTrack = async (event) => {
                     return;
                 }
 
-                const contributingSources = receiverManager.getContributingSources(receiver);
-
-                const usersForContributingSourcesWithAudioLevel = contributingSources.map(source => {
-                    return {
-                        audioLevel: source?.audioLevel || 0, 
-                        user: userManager.getUserByStreamId(source.source.toString())
-                    }
-                }).filter(x => x.user).sort((a, b) => b.audioLevel - a.audioLevel);
-
-                const userForContributingSourceWithLoudestAudio = usersForContributingSourcesWithAudioLevel[0]?.user;
-
-
-                //console.log('contributingSources', contributingSources);
-                //console.log('deviceOutputMap', userManager.deviceOutputMap);
-                //console.log('usersForContributingSources', usersForContributingSources);
-
-                // Send audio data through websocket
-                if (userForContributingSourceWithLoudestAudio) {
-                    const firstUserId = userForContributingSourceWithLoudestAudio?.deviceId;
-                    if (firstUserId) {
-                        ws.sendPerParticipantAudio(firstUserId, audioData);
-                    }
-                }
-                
                 // Pass through the original frame
                 controller.enqueue(frame);
             } catch (error) {
@@ -2239,9 +2180,6 @@ new RTCInterceptor({
             // but we don't need to do anything with the video tracks
             if (event.track.kind === 'audio') {
                 window.styleManager.addAudioTrack(event.track);
-                if (window.initialData.sendPerParticipantAudio) {
-                    handleAudioTrack(event);
-                }
             }
             if (event.track.kind === 'video') {
                 window.styleManager.addVideoTrack(event);

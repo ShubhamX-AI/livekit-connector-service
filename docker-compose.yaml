@@ -1,14 +1,15 @@
 services:
-  connector:
+  worker:
     build: .
-    # The connector talks to a LiveKit server on the host (LIVEKIT_URL defaults
-    # to ws://127.0.0.1:7880 in .env) and serves its own WebSocket on 127.0.0.1.
     network_mode: host
     env_file: .env
-    # Chrome needs more shared memory than Docker's 64MB default.
     shm_size: 2gb
-    # Failure screenshots and DOM dumps land here for diagnosing rejected joins.
     volumes:
       - ./artifacts:/app/artifacts
-    stdin_open: true
-    tty: true
+    command: ["python3", "-m", "livekit.agents", "start", "agent_run.py"]
+
+  control:
+    build: .
+    network_mode: host
+    env_file: .env
+    command: ["python3", "control_run.py"]

@@ -1,7 +1,8 @@
-import json
 import logging
 import os
+import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,12 +13,13 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .config import ConnectorConfig
+from ..browser.payload import build_initial_script
+from ..browser.websocket import BrowserWebSocketServer
+from ..config import ConnectorConfig
+from ..events import READY_EVENT, WAITING_EVENT
 from .humanized_input import HumanizedInput
-from .websocket_server import BrowserWebSocketServer
 
 logger = logging.getLogger(__name__)
-ASSET_DIR = Path(__file__).resolve().parents[2] / "assets"
 JOIN_RETRY_DELAY_SECONDS = 5
 ADMISSION_POLL_SECONDS = 2
 BLOCKED_TEXTS = ("You can't join this video call", "There is a problem connecting to this video call")
@@ -48,17 +50,25 @@ class WaitingRoomTimeoutError(RuntimeError):
 
 
 class GoogleMeetChromeSession:
-    def __init__(self, config: ConnectorConfig, livekit_sync):
+    def __init__(
+        self,
+        config: ConnectorConfig,
+        livekit_sync,
+        on_status: Callable[[str, str | None], None] | None = None,
+    ):
         self.config = config
         self.livekit_sync = livekit_sync
+        self.on_status = on_status
         self.display = None
         self.driver = None
         self.humanized_input = None
+        self.stop_requested = threading.Event()
         self.websocket_server = BrowserWebSocketServer(
             host=config.websocket_host,
             port=config.websocket_port,
             livekit_sync=livekit_sync,
             upstream_livekit_url=config.livekit_url,
+            on_status=on_status,
         )
 
     @property
@@ -118,21 +128,23 @@ class GoogleMeetChromeSession:
             "botName": self.config.bot_display_name,
             "addClickRipple": False,
             "recordingView": "speaker_view",
-            "sendMixedAudio": False,
-            "sendPerParticipantAudio": True,
+            # The assistant listens to one linked participant, so the connector always publishes
+            # Google's mixed audio rather than one track per speaker.
+            # Pins the mixing AudioContext's rate so the float32 frames the page sends match the
+            # rate we declare to LiveKit. Left to the browser's default, a host that negotiated
+            # 44.1 kHz would produce audio played back ~9% fast.
+            "audioSampleRate": self.config.sample_rate,
+            "sendMixedAudio": True,
             "perParticipantRealtimeVideoConfiguration": {
                 "webcam_configuration": {"enabled": False},
                 "screenshare_configuration": {"enabled": False},
             },
-            "roomSyncSourceParticipantConfiguration": self.livekit_sync.source_browser_config(self.config.source_selector),
+            "roomSyncSourceParticipantConfiguration": self.livekit_sync.source_browser_config(),
             "sendPerParticipantVideo": False,
             "collectCaptions": False,
             "recordParticipantSpeechStartStopEvents": False,
         }
-        script_parts = [f"window.initialData = {json.dumps(initial_data)};", "window.googleMeetInitialData = {modifyDomForVideoRecording: false, disableIncomingVideo: true};"]
-        for filename in ("protobuf.min.js", "pako.min.js", "livekit-client.umd.min.js", "livekit-client-adapter.js", "shared_chromedriver_payload.js", "google_meet_chromedriver_payload.js"):
-            script_parts.append((ASSET_DIR / filename).read_text(encoding="utf-8"))
-        return "\n".join(script_parts)
+        return build_initial_script(initial_data)
 
     def _join_meeting(self):
         # Google sometimes rejects a join with "You can't join this video call". That block is
@@ -185,6 +197,7 @@ class GoogleMeetChromeSession:
         self._wait_until_admitted()
         self.driver.execute_script("window.ws?.enableMediaSending();")
         logger.info("Media sending enabled")
+        self._emit_status(READY_EVENT, None)
 
     def _wait_until_admitted(self):
         """Block until the bot is actually in the call.
@@ -197,6 +210,8 @@ class GoogleMeetChromeSession:
         deadline = time.monotonic() + self.config.waiting_room_timeout_seconds
         logged_waiting = False
         while time.monotonic() < deadline:
+            if self.stop_requested.is_set():
+                raise RuntimeError("Connector shutdown requested")
             self._raise_if_blocked()
             self._raise_if_denied()
             if self._is_in_call():
@@ -205,6 +220,7 @@ class GoogleMeetChromeSession:
             if not logged_waiting and self._page_contains(WAITING_ROOM_TEXT):
                 logger.info("Waiting to be admitted (timeout %ss)", self.config.waiting_room_timeout_seconds)
                 logged_waiting = True
+                self._emit_status(WAITING_EVENT, WAITING_ROOM_TEXT)
             time.sleep(ADMISSION_POLL_SECONDS)
         raise WaitingRoomTimeoutError(f"Not admitted within {self.config.waiting_room_timeout_seconds}s")
 
@@ -213,6 +229,10 @@ class GoogleMeetChromeSession:
 
     def _page_contains(self, text):
         return bool(self._visible_elements_containing((text,)))
+
+    def _emit_status(self, event: str, detail: str | None) -> None:
+        if self.on_status:
+            self.on_status(event, detail)
 
     def _visible_elements_containing(self, texts):
         xpath = "//*[" + " or ".join(f'contains(text(), "{text}")' for text in texts) + "]"
@@ -284,6 +304,7 @@ class GoogleMeetChromeSession:
             logger.debug("Google Meet leave button unavailable during shutdown")
 
     def close(self):
+        self.stop_requested.set()
         try:
             self.leave()
         finally:
