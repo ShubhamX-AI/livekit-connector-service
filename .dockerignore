@@ -1,0 +1,8 @@
+.venv
+.ruff_cache
+__pycache__
+*.pyc
+.env
+tests
+Dockerfile
+docker-compose.yaml

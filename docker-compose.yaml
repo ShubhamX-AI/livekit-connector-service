@@ -1,0 +1,11 @@
+services:
+  connector:
+    build: .
+    # The connector talks to a LiveKit server on the host (LIVEKIT_URL defaults
+    # to ws://127.0.0.1:7880 in .env) and serves its own WebSocket on 127.0.0.1.
+    network_mode: host
+    env_file: .env
+    # Chrome needs more shared memory than Docker's 64MB default.
+    shm_size: 2gb
+    stdin_open: true
+    tty: true
