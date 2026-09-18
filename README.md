@@ -94,6 +94,11 @@ docker compose up --build worker
 docker compose up --build control
 ```
 
+The control backend is published on `http://127.0.0.1:8080`; its health endpoint is
+`/health`. Docker services reach LiveKit and the core API on the host through
+`host.docker.internal`. Override `DOCKER_LIVEKIT_URL` or `DOCKER_CORE_API_URL` when those
+services run at different addresses.
+
 Chrome uses Xvfb and needs the configured shared-memory allocation. Failed joins write screenshots,
 HTML, and URL artifacts under `./artifacts`.
 

@@ -1,8 +1,14 @@
+x-connector-environment: &connector-environment
+  LIVEKIT_URL: ${DOCKER_LIVEKIT_URL:-ws://host.docker.internal:7880}
+  CORE_API_URL: ${DOCKER_CORE_API_URL:-http://host.docker.internal:8001}
+
 services:
   worker:
     build: .
-    network_mode: host
     env_file: .env
+    environment: *connector-environment
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     shm_size: 2gb
     volumes:
       - ./artifacts:/app/artifacts
@@ -10,6 +16,10 @@ services:
 
   control:
     build: .
-    network_mode: host
     env_file: .env
+    environment: *connector-environment
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${CONTROL_PORT:-8080}:8080"
     command: ["python3", "control_run.py"]

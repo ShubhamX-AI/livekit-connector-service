@@ -122,6 +122,11 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(config.bot_display_name, "LiveKit Assistant")
 
+    def test_worker_entrypoint_imports(self):
+        from standalone_google_meet.livekit.worker import entrypoint
+
+        self.assertEqual(entrypoint.__name__, "entrypoint")
+
     async def test_ready_lifecycle_event_sets_recoverable_attribute(self):
         participant = FakeParticipant()
         lifecycle = ConnectorLifecycle(participant)

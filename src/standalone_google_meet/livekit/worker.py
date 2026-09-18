@@ -6,13 +6,9 @@ from livekit.agents import AutoSubscribe, JobContext
 
 from ..chrome.session import GoogleMeetChromeSession
 from ..config import ConnectorConfig, ConnectorRuntimeConfig, MeetingJobConfig
+from ..events import ENDED_EVENT, FAILED_EVENT, READY_EVENT
 from .audio_sync import LiveKitAudioSync
-from .lifecycle import (
-    ENDED_EVENT,
-    FAILED_EVENT,
-    READY_EVENT,
-    ConnectorLifecycle,
-)
+from .lifecycle import ConnectorLifecycle
 
 logger = logging.getLogger(__name__)
 
