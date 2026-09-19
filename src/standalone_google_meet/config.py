@@ -25,6 +25,10 @@ class ConnectorRuntimeConfig:
     video_frame_height: int = 720
     join_attempts: int = 3
     waiting_room_timeout_seconds: int = 300
+    # Google Meet only reports that a call ended minutes after the last human leaves,
+    # and the core engine waits for this connector to say so before it tears the call
+    # down. Ending the job once the bot is the only one left closes that gap.
+    alone_in_meeting_timeout_seconds: int = 30
     artifact_dir: str = "/app/artifacts"
     max_concurrent_jobs: int = 1
 
@@ -44,6 +48,9 @@ class ConnectorRuntimeConfig:
             "video_frame_height": int(os.environ.get("VIDEO_FRAME_HEIGHT", "720")),
             "join_attempts": int(os.environ.get("JOIN_ATTEMPTS", "3")),
             "waiting_room_timeout_seconds": int(os.environ.get("WAITING_ROOM_TIMEOUT_SECONDS", "300")),
+            "alone_in_meeting_timeout_seconds": int(
+                os.environ.get("ALONE_IN_MEETING_TIMEOUT_SECONDS", "30")
+            ),
             "artifact_dir": os.environ.get("ARTIFACT_DIR", "/app/artifacts"),
             "max_concurrent_jobs": int(os.environ.get("CONNECTOR_MAX_CONCURRENT_JOBS", "1")),
         }
@@ -163,6 +170,10 @@ class ConnectorConfig:
     @property
     def waiting_room_timeout_seconds(self) -> int:
         return self.runtime.waiting_room_timeout_seconds
+
+    @property
+    def alone_in_meeting_timeout_seconds(self) -> int:
+        return self.runtime.alone_in_meeting_timeout_seconds
 
     @property
     def artifact_dir(self) -> str:

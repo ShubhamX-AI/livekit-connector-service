@@ -118,6 +118,16 @@
   
       addRemoteTrack(remoteTrack, publication, participant) {
         const mediaTrack = remoteTrack.mediaStreamTrack;
+
+        /*
+         * Belt and braces for the peer-connection flag above: a track that
+         * reaches us over LiveKit is the assistant's own output, so pull it back
+         * out of the meeting audio mix if the payload picked it up anyway, for
+         * example after a LiveKit reconnect built a fresh peer connection.
+         */
+        if (mediaTrack?.kind === "audio") {
+          window.styleManager?.removeAudioTrack?.(mediaTrack);
+        }
   
         const isUsableKind =
           mediaTrack?.kind === "audio" || mediaTrack?.kind === "video";
@@ -331,6 +341,14 @@
   
       await disconnect();
   
+      /*
+       * The Google Meet payload wraps the global RTCPeerConnection constructor so
+       * it can mix every meeting audio track it sees. The connections built below
+       * carry the assistant's own audio, which must never enter that mix, so they
+       * are flagged for the duration of the connect.
+       */
+      window.excludeNewPeerConnectionsFromMeetingAudioMix = true;
+
       const room = new Room({
         /*
          * We consume RemoteTrack.mediaStreamTrack directly instead of
@@ -389,6 +407,8 @@
   
         await disconnect();
         throw error;
+      } finally {
+        window.excludeNewPeerConnectionsFromMeetingAudioMix = false;
       }
     }
   

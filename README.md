@@ -50,23 +50,24 @@ To trigger meeting calls and send meeting links, clients **must trigger the Voic
 ### Key Service Roles & Hierarchy
 
 1. **VoiceKit Service (Primary Trigger Entry Point)**:
+
    - User accounts, user IDs, VoiceKit API keys, and conversational agent configurations all live in VoiceKit.
    - When a meeting link needs to be processed (e.g., via the Wispr API or client integrations), requests must go to **VoiceKit**.
    - VoiceKit resolves the user context, attaches agent settings, and triggers the core backend engine.
-
 2. **Core Backend Service (LiveKit Engine)**:
+
    - The central engine that orchestrates call records, billing/usage, recording, and the shared LiveKit room.
    - Communicates with agent workers over **LiveKit WebSocket** (`LIVEKIT_URL`).
    - Dispatches jobs to both the conversational `api-agent` and the `meet-connector` worker.
-
 3. **Connector Worker (`meet-connector`) — MANDATORY**:
+
    - **Running this worker is strictly mandatory.**
    - The worker (`agent_run.py`) must be actively running and connected to the core engine over WebSocket.
    - **Fixed Agent Name**: The worker registers with LiveKit using `agent_name="meet-connector"`. The LiveKit core engine dispatches meeting jobs specifically targeting the `meet-connector` agent name. This exact name is the dispatch target; modifying it will prevent the core engine from routing jobs to this worker.
    - Whenever an external trigger (such as VoiceKit or Wispr API) asks the core service to start a meeting call, the core service dispatches the `meet-connector` agent to this worker over WebSocket.
    - If this worker is not running, the dispatch fails or times out, and the bot cannot join the meeting.
-
 4. **Control Backend (`control_run.py`) — OPTIONAL**:
+
    - An optional FastAPI adapter exposing `POST /meetings/join`.
    - Used primarily for local development and testing to forward join requests directly to the core API using `VOICEKIT_API_URL` and `VOICEKIT_API_KEY`.
    - In production environments, triggers flow through VoiceKit.
@@ -116,12 +117,12 @@ The worker and the **LiveKit core engine / `api-agent` share a strict event cont
                                                   and cleans up room
 ```
 
-| Event Name | Worker State Update | LiveKit Core Engine & Agent Action |
-| :--- | :--- | :--- |
-| `waiting` | Bot reached the Google Meet URL and is in the knock/waiting room awaiting host admission. | Core tracks that navigation succeeded and the bot is waiting for admission. |
-| `ready` | Host admitted bot; mixed audio track is published to the room; virtual microphone relay is ready. | Core `api-agent` initiates speech/greeting, listening to meeting participants. Fallback attribute `lk.meeting_connector_status=ready` ensures late-joining agents catch readiness. |
-| `failed` | Failure during launch, navigation, knock rejection, or audio pipeline error (error passed in `detail`). | Core marks the call record failed, dispatches failure webhooks to callers, and halts assistant processes. |
-| `ended` | Meeting completed, host ended call, participants departed, or worker shut down. | Core triggers call termination, billing calculation, room cleanup, and post-call webhook dispatches. |
+| Event Name  | Worker State Update                                                                                      | LiveKit Core Engine & Agent Action                                                                                                                                                    |
+| :---------- | :------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `waiting` | Bot reached the Google Meet URL and is in the knock/waiting room awaiting host admission.                | Core tracks that navigation succeeded and the bot is waiting for admission.                                                                                                           |
+| `ready`   | Host admitted bot; mixed audio track is published to the room; virtual microphone relay is ready.        | Core`api-agent` initiates speech/greeting, listening to meeting participants. Fallback attribute `lk.meeting_connector_status=ready` ensures late-joining agents catch readiness. |
+| `failed`  | Failure during launch, navigation, knock rejection, or audio pipeline error (error passed in`detail`). | Core marks the call record failed, dispatches failure webhooks to callers, and halts assistant processes.                                                                             |
+| `ended`   | Meeting completed, host ended call, participants departed, or worker shut down.                          | Core triggers call termination, billing calculation, room cleanup, and post-call webhook dispatches.                                                                                  |
 
 > [!NOTE]
 > These event names (`waiting`, `ready`, `failed`, `ended`) and topic (`meeting_connector_events`) must match identically between this connector repository and the LiveKit core service so the core engine can properly interpret meeting lifecycle signals.
@@ -139,6 +140,7 @@ cp .env.example .env
 ```
 
 Key environment variables:
+
 - `LIVEKIT_URL`: WebSocket URL to the core LiveKit engine (e.g. `ws://127.0.0.1:7880` or `wss://livekit.example.com`).
 - `LIVEKIT_API_KEY` & `LIVEKIT_API_SECRET`: LiveKit credentials used by the worker to connect and register.
 - `CONNECTOR_MAX_CONCURRENT_JOBS`: Maximum concurrent Google Meet browser sessions per worker (default: `1`).

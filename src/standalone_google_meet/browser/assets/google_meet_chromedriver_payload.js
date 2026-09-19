@@ -258,6 +258,12 @@ class StyleManager {
 
         this.audioContext = null;
         this.audioTracks = [];
+
+        // Destination node every meeting audio track is mixed into, plus the sources
+        // already connected to it. Both are null/empty until startSilenceDetection runs.
+        this.mixDestination = null;
+        this.audioSources = [];
+        this.connectedAudioTracks = new Map();
         this.silenceThreshold = 0.5;
         this.silenceCheckInterval = null;
         this.memoryUsageCheckInterval = null;
@@ -269,6 +275,53 @@ class StyleManager {
 
     addAudioTrack(audioTrack) {
         this.audioTracks.push(audioTrack);
+        this.connectAudioTrack(audioTrack);
+    }
+
+    /*
+     * Connect one meeting audio track into the mix. Google Meet delivers most
+     * participants' tracks after the bot has been admitted, which is also when
+     * startSilenceDetection runs, so tracks have to be connected as they arrive
+     * rather than from a single snapshot taken at that moment. A track that
+     * arrives before the AudioContext exists stays buffered in this.audioTracks
+     * and is connected by startSilenceDetection.
+     */
+    connectAudioTrack(audioTrack) {
+        if (!this.mixDestination || !audioTrack || this.connectedAudioTracks.has(audioTrack)) {
+            return;
+        }
+
+        try {
+            const source = this.audioContext.createMediaStreamSource(new MediaStream([audioTrack]));
+            source.connect(this.mixDestination);
+            this.connectedAudioTracks.set(audioTrack, source);
+            this.audioSources.push(source);
+        } catch (error) {
+            console.error('Failed to connect a meeting audio track into the mix:', error);
+        }
+    }
+
+    /*
+     * Take one track back out of the mix. The assistant's own audio reaches this
+     * page over a LiveKit peer connection, and RTCInterceptor wraps the global
+     * RTCPeerConnection constructor, so that audio also arrives at the 'track'
+     * listener that feeds addAudioTrack. Mixing it would send the assistant's
+     * voice straight back to the assistant as meeting audio.
+     */
+    removeAudioTrack(audioTrack) {
+        const source = this.connectedAudioTracks.get(audioTrack);
+
+        if (source) {
+            try {
+                source.disconnect();
+            } catch (error) {
+                console.error('Failed to disconnect an audio track from the mix:', error);
+            }
+            this.connectedAudioTracks.delete(audioTrack);
+            this.audioSources = this.audioSources.filter(candidate => candidate !== source);
+        }
+
+        this.audioTracks = this.audioTracks.filter(candidate => candidate !== audioTrack);
     }
 
     checkAudioActivity() {
@@ -361,18 +414,15 @@ class StyleManager {
              window.initialData.audioSampleRate ? { sampleRate: window.initialData.audioSampleRate } : undefined
          );
 
-         this.audioSources = this.audioTracks.map(track => {
-             const mediaStream = new MediaStream([track]);
-             return this.audioContext.createMediaStreamSource(mediaStream);
-         });
- 
          // Create a destination node
          const destination = this.audioContext.createMediaStreamDestination();
- 
-         // Connect all sources to the destination
-         this.audioSources.forEach(source => {
-             source.connect(destination);
-         });
+         this.mixDestination = destination;
+         this.audioSources = [];
+         this.connectedAudioTracks = new Map();
+
+         // Connect the tracks that arrived before this ran. Everything that arrives
+         // afterwards is connected by addAudioTrack.
+         this.audioTracks.forEach(track => this.connectAudioTrack(track));
  
          // Create analyzer and connect it to the destination
          this.analyser = this.audioContext.createAnalyser();
@@ -2160,6 +2210,10 @@ const handleAudioTrack = async (event) => {
 new RTCInterceptor({
     onPeerConnectionCreate: (peerConnection) => {
         console.log('New RTCPeerConnection created:', peerConnection);
+        // RTCPeerConnection is wrapped globally, so this also fires for the LiveKit
+        // room that carries the assistant's audio. Remember which connections those
+        // are, so their tracks stay out of the meeting audio mix.
+        peerConnection.excludeFromMeetingAudioMix = window.excludeNewPeerConnectionsFromMeetingAudioMix === true;
         peerConnection.addEventListener('datachannel', (event) => {
             console.log('datachannel', event);
             if (event.channel.label === "collections") {               
@@ -2178,7 +2232,7 @@ new RTCInterceptor({
             });
             // We need to capture every audio track in the meeting,
             // but we don't need to do anything with the video tracks
-            if (event.track.kind === 'audio') {
+            if (event.track.kind === 'audio' && !peerConnection.excludeFromMeetingAudioMix) {
                 window.styleManager.addAudioTrack(event.track);
             }
             if (event.track.kind === 'video') {

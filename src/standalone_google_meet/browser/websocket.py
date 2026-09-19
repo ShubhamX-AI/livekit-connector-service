@@ -12,17 +12,42 @@ from .protocol import JSON, MIXED_AUDIO, decode_json, decode_message
 
 logger = logging.getLogger(__name__)
 
+# Browser-side messages worth surfacing in the connector log. They are the only evidence of
+# what the page's LiveKit adapter did with the assistant's audio track.
+BROWSER_DIAGNOSTIC_MESSAGES = frozenset(
+    {
+        "LiveKitTrackAdded",
+        "LiveKitTrackNotAccepted",
+        "LiveKitConnectionFailed",
+        "LiveKitVideoTrackNotAvailable",
+        "Error",
+    }
+)
+
 
 class BrowserWebSocketServer:
-    def __init__(self, *, host, port, livekit_sync, upstream_livekit_url, on_status: Callable[[str, str | None], None] | None = None):
+    def __init__(
+        self,
+        *,
+        host,
+        port,
+        livekit_sync,
+        upstream_livekit_url,
+        on_status: Callable[[str, str | None], None] | None = None,
+        alone_in_meeting_timeout_seconds: int = 30,
+    ):
         self.host = host
         self.port = port
         self.livekit_sync = livekit_sync
         self.upstream_livekit_url = upstream_livekit_url
         self.on_status = on_status
+        self.alone_in_meeting_timeout_seconds = alone_in_meeting_timeout_seconds
         self.server = None
         self.thread = None
         self.started = threading.Event()
+        self._participants_in_meeting: set[str] = set()
+        self._alone_lock = threading.Lock()
+        self._alone_timer: threading.Timer | None = None
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name="meet-browser-websocket", daemon=True)
@@ -62,19 +87,69 @@ class BrowserWebSocketServer:
         message_type = message.get("type")
         if message_type == "UsersUpdate":
             for participant in message.get("newUsers", []) + message.get("updatedUsers", []):
+                device_id = participant.get("deviceId")
                 if participant.get("humanized_status") == "in_meeting":
-                    logger.info(
-                        "Meet participant joined: %s (%s)",
-                        participant.get("fullName") or participant.get("deviceId"),
-                        participant.get("deviceId"),
-                    )
+                    if device_id and device_id not in self._participants_in_meeting:
+                        logger.info(
+                            "Meet participant joined: %s (%s)",
+                            participant.get("fullName") or device_id,
+                            device_id,
+                        )
+                    self._participants_in_meeting.add(device_id)
+                else:
+                    self._participants_in_meeting.discard(device_id)
             for participant in message.get("removedUsers", []):
                 logger.info("Meet participant left: %s", participant.get("deviceId"))
+                self._participants_in_meeting.discard(participant.get("deviceId"))
+            self._reschedule_alone_check()
         elif message_type == "MeetingStatusChange":
             change = message.get("change")
             logger.info("Google Meet status changed: %s", change)
             if change in {"meeting_ended", "removed_from_meeting"} and self.on_status:
                 self.on_status(ENDED_EVENT, change)
+        elif message_type in BROWSER_DIAGNOSTIC_MESSAGES:
+            # The browser's LiveKit adapter reports here whether it accepted the assistant's
+            # track. Without these lines a rejected track is silent on both sides, and the
+            # meeting simply never hears the assistant.
+            logger.info("Browser reported %s: %s", message_type, message)
+
+    def _bot_is_alone(self) -> bool:
+        # The bot counts as a participant in Meet's own list, so one entry means
+        # every human has left.
+        return len(self._participants_in_meeting) <= 1
+
+    def _reschedule_alone_check(self) -> None:
+        """Arm or cancel the timer that ends the call once every human has left.
+
+        Google Meet keeps a lone bot in the call for minutes before it reports
+        `meeting_ended`, and the core engine will not tear the call down until this
+        connector says the meeting is over, so the two would wait for each other.
+        """
+        with self._alone_lock:
+            if self._bot_is_alone():
+                if self._alone_timer is not None:
+                    return
+                self._alone_timer = threading.Timer(
+                    self.alone_in_meeting_timeout_seconds, self._report_alone_in_meeting
+                )
+                self._alone_timer.daemon = True
+                self._alone_timer.start()
+                return
+            if self._alone_timer is not None:
+                self._alone_timer.cancel()
+                self._alone_timer = None
+
+    def _report_alone_in_meeting(self) -> None:
+        with self._alone_lock:
+            self._alone_timer = None
+            if not self._bot_is_alone():
+                return
+        logger.info(
+            "Every other participant left the meeting %ss ago; ending the call",
+            self.alone_in_meeting_timeout_seconds,
+        )
+        if self.on_status:
+            self.on_status(ENDED_EVENT, "alone_in_meeting")
 
     @staticmethod
     def _float32_to_pcm16(raw: bytes) -> bytes:
@@ -108,6 +183,10 @@ class BrowserWebSocketServer:
             pass
 
     def close(self):
+        with self._alone_lock:
+            if self._alone_timer is not None:
+                self._alone_timer.cancel()
+                self._alone_timer = None
         if self.server:
             self.server.shutdown()
         if self.thread:

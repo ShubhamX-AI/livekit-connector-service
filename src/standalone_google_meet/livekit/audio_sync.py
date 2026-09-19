@@ -4,6 +4,7 @@ import time
 import uuid
 
 import jwt
+import numpy as np
 from livekit import rtc
 
 logger = logging.getLogger(__name__)
@@ -14,6 +15,7 @@ class LiveKitAudioSync:
 
     TOKEN_TTL_SECONDS = 6 * 60 * 60
     TRACK_NAME = "meet-audio-mixed"
+    AMPLITUDE_LOG_INTERVAL_SECONDS = 1.0
 
     def __init__(
         self,
@@ -38,6 +40,7 @@ class LiveKitAudioSync:
         self.audio_queue: asyncio.Queue[bytes] | None = None
         self.capture_task: asyncio.Task | None = None
         self.closed = False
+        self._last_amplitude_log = 0.0
 
     def _token(self, identity: str, name: str, grants: dict) -> str:
         now = int(time.time())
@@ -114,12 +117,28 @@ class LiveKitAudioSync:
             except Exception:
                 logger.exception("Failed to publish a mixed Google Meet audio frame")
 
+    def _log_amplitude(self, pcm_s16le: bytes) -> None:
+        """Log the peak sample of the mixed meeting audio about once a second.
+
+        The browser builds the mix from whatever audio tracks it has connected to its
+        AudioContext destination. A flat zero here while somebody in the meeting is
+        speaking means the mix is empty and the assistant is deaf, which is a different
+        fault from the assistant hearing silence.
+        """
+        now = time.monotonic()
+        if now - self._last_amplitude_log < self.AMPLITUDE_LOG_INTERVAL_SECONDS:
+            return
+        self._last_amplitude_log = now
+        peak = int(np.abs(np.frombuffer(pcm_s16le, dtype=np.int16)).max())
+        logger.info("Mixed Google Meet audio peak amplitude: %s", peak)
+
     async def _capture_audio(self, pcm_s16le: bytes) -> None:
         if self.source is None or not pcm_s16le:
             return
         samples = len(pcm_s16le) // 2
         if samples == 0:
             return
+        self._log_amplitude(pcm_s16le)
         await self.source.capture_frame(
             rtc.AudioFrame(
                 data=pcm_s16le,

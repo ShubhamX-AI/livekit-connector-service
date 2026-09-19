@@ -69,6 +69,7 @@ class GoogleMeetChromeSession:
             livekit_sync=livekit_sync,
             upstream_livekit_url=config.livekit_url,
             on_status=on_status,
+            alone_in_meeting_timeout_seconds=config.alone_in_meeting_timeout_seconds,
         )
 
     @property
