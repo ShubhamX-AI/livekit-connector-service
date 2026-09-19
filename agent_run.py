@@ -16,6 +16,8 @@ server = AgentServer.from_server_options(
         api_secret=runtime.livekit_api_secret,
         ws_url=runtime.livekit_url,
         entrypoint_fnc=entrypoint,
+        # MUST remain "meet-connector": the LiveKit core engine explicitly dispatches
+        # meeting jobs to this exact agent name over WebSocket.
         agent_name="meet-connector",
         num_idle_processes=0,
         load_fnc=_worker_load,

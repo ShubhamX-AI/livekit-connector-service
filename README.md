@@ -1,37 +1,84 @@
 # Google Meet to LiveKit connector
 
-This repository contains the `meet-connector` LiveKit worker. It joins one Google Meet per
-LiveKit job, publishes the meeting's mixed audio into the shared LiveKit room, and routes the
-assistant's selected LiveKit audio back into Google Meet.
+This repository contains the `meet-connector` LiveKit worker. It joins a Google Meet per
+LiveKit job, captures and publishes the meeting's mixed audio into a shared LiveKit room, and routes the
+assistant's LiveKit audio back into Google Meet.
 
-The core API remains authoritative for meeting calls. It creates the room, dispatches both
-`api-agent` and `meet-connector`, owns the `CallRecord`, recording, usage, webhook, and teardown,
-and receives connector lifecycle events from the shared room.
+---
 
-## Runtime roles
+## System Architecture & Triggering Flow
+
+To trigger meeting calls and send meeting links, clients **must trigger the VoiceKit service**, not the core backend directly.
 
 ```text
-caller -> control backend -> core POST /meeting_call/join
-                         -> api-agent
-                         -> meet-connector -> Chrome/Xvfb -> Google Meet
+  Caller / Client App / Wispr API
+                │
+                ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │ VoiceKit Service                                            │
+   │  - Manages User Accounts & User IDs                         │
+   │  - Validates VoiceKit API Keys                              │
+   │  - Resolves Agent Configurations & Details                  │
+   └────────────────────────────┬────────────────────────────────┘
+                                │ Triggers Meeting Call (HTTP)
+                                ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │ Core Backend Engine (LiveKit Server)                        │
+   │  - Authoritative room creator & call lifecycle manager      │
+   │  - Dispatches 'api-agent' (STT/LLM/TTS)                     │
+   │  - Dispatches 'meet-connector' job over WebSocket           │
+   └────────────────────────────┬────────────────────────────────┘
+                                │ WebSocket Dispatch (LIVEKIT_URL)
+                                ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │ livekit-connector-service (THIS REPO)                       │
+   │                                                             │
+   │  [MANDATORY] Connector Worker (agent_run.py)                │
+   │    • Connected to Core via WebSocket (LIVEKIT_URL)          │
+   │    • Listens for and accepts 'meet-connector' jobs          │
+   │    • Spawns Selenium/Chrome/Xvfb session                    │
+   │    • Bridges mixed audio bidirectionally                    │
+   │                                                             │
+   │  [OPTIONAL] Control Backend (control_run.py)                │
+   │    • Local developer HTTP adapter to trigger core endpoints │
+   └────────────────────────────┬────────────────────────────────┘
+                                │ Joins & Bridges Audio
+                                ▼
+                         Google Meet Session
 ```
 
-- **Worker**: `agent_run.py` registers `meet-connector` with LiveKit. Every job reads its
-  `meeting_url`, `platform`, and `bot_display_name` from LiveKit job metadata.
-- **Control backend**: `control_run.py` exposes `POST /meetings/join`. It validates the request,
-  calls the core API with a bearer token, and returns the core response. It is a request adapter,
-  not a dispatcher and not a second source of call state.
+### Key Service Roles & Hierarchy
 
-There is no fixed meeting URL or room in the worker environment. The only deployment-time values
-are LiveKit credentials, browser/runtime settings, worker capacity, and core API credentials for
-the optional control backend.
+1. **VoiceKit Service (Primary Trigger Entry Point)**:
+   - User accounts, user IDs, VoiceKit API keys, and conversational agent configurations all live in VoiceKit.
+   - When a meeting link needs to be processed (e.g., via the Wispr API or client integrations), requests must go to **VoiceKit**.
+   - VoiceKit resolves the user context, attaches agent settings, and triggers the core backend engine.
 
-## Audio and lifecycle
+2. **Core Backend Service (LiveKit Engine)**:
+   - The central engine that orchestrates call records, billing/usage, recording, and the shared LiveKit room.
+   - Communicates with agent workers over **LiveKit WebSocket** (`LIVEKIT_URL`).
+   - Dispatches jobs to both the conversational `api-agent` and the `meet-connector` worker.
+
+3. **Connector Worker (`meet-connector`) — MANDATORY**:
+   - **Running this worker is strictly mandatory.**
+   - The worker (`agent_run.py`) must be actively running and connected to the core engine over WebSocket.
+   - **Fixed Agent Name**: The worker registers with LiveKit using `agent_name="meet-connector"`. The LiveKit core engine dispatches meeting jobs specifically targeting the `meet-connector` agent name. This exact name is the dispatch target; modifying it will prevent the core engine from routing jobs to this worker.
+   - Whenever an external trigger (such as VoiceKit or Wispr API) asks the core service to start a meeting call, the core service dispatches the `meet-connector` agent to this worker over WebSocket.
+   - If this worker is not running, the dispatch fails or times out, and the bot cannot join the meeting.
+
+4. **Control Backend (`control_run.py`) — OPTIONAL**:
+   - An optional FastAPI adapter exposing `POST /meetings/join`.
+   - Used primarily for local development and testing to forward join requests directly to the core API using `VOICEKIT_API_URL` and `VOICEKIT_API_KEY`.
+   - In production environments, triggers flow through VoiceKit.
+
+---
+
+## Audio and Lifecycle
 
 ```text
 Google Meet mixed audio
     -> Chrome WebRTC capture
-    -> browser WebSocket
+    -> browser WebSocket (127.0.0.1:8765)
     -> meet-connector worker participant
     -> one mixed LiveKit audio track
     -> api-agent STT/LLM/TTS
@@ -40,35 +87,85 @@ Google Meet mixed audio
     -> Google Meet virtual microphone
 ```
 
-The connector publishes lifecycle data on `meeting_connector_events`:
+### Meeting Lifecycle Events & Core Synchronization
 
-- `waiting`: Google is waiting for admission.
-- `ready`: the bot is admitted, the mixed track is published, and media sending is enabled.
-- `failed`: metadata, browser, join, or runtime failure.
-- `ended`: Google Meet ended or the connector job is shutting down.
+The worker and the **LiveKit core engine / `api-agent` share a strict event contract** via the LiveKit room data channel and participant attributes. These events allow the core engine and conversational agent to track real-time meeting progress from this worker:
 
-On `ready`, the worker also sets `lk.meeting_connector_status=ready` on its LiveKit participant.
-The core assistant uses this attribute to recover readiness if the data packet arrived before it
-was listening.
+- **Data Topic**: `meeting_connector_events` (reliable data packets: `{"event": "<name>", "detail": "..."}`)
+- **Readiness Participant Attribute**: `lk.meeting_connector_status` (set to `ready` on successful admission)
 
-## Start locally
+```text
+ Connector Worker (This Service)                  LiveKit Core Engine / api-agent
+─────────────────────────────────                ─────────────────────────────────
+ Bot enters waiting room
+       │
+       ├──── publish_data("waiting") ───────────► Core notes bot is at meeting,
+       │                                          awaiting host knock admission
+ Bot admitted & audio track live
+       │
+       ├──── publish_data("ready") ─────────────► Core api-agent begins conversational
+       ├──── set_attributes("ready") ───────────► turn-taking (STT/LLM/TTS)
+       │
+ Join failure / admission timeout
+       │
+       └──── publish_data("failed", detail) ────► Core triggers teardown, logs reason,
+                                                  and fires failure webhooks
+ Meeting ended / worker stopping
+       │
+       └──── publish_data("ended") ─────────────► Core finalizes recording, usage,
+                                                  and cleans up room
+```
 
-Copy `.env.example` to `.env` and fill in deployment credentials. Do not commit `.env`.
+| Event Name | Worker State Update | LiveKit Core Engine & Agent Action |
+| :--- | :--- | :--- |
+| `waiting` | Bot reached the Google Meet URL and is in the knock/waiting room awaiting host admission. | Core tracks that navigation succeeded and the bot is waiting for admission. |
+| `ready` | Host admitted bot; mixed audio track is published to the room; virtual microphone relay is ready. | Core `api-agent` initiates speech/greeting, listening to meeting participants. Fallback attribute `lk.meeting_connector_status=ready` ensures late-joining agents catch readiness. |
+| `failed` | Failure during launch, navigation, knock rejection, or audio pipeline error (error passed in `detail`). | Core marks the call record failed, dispatches failure webhooks to callers, and halts assistant processes. |
+| `ended` | Meeting completed, host ended call, participants departed, or worker shut down. | Core triggers call termination, billing calculation, room cleanup, and post-call webhook dispatches. |
 
-Start the worker:
+> [!NOTE]
+> These event names (`waiting`, `ready`, `failed`, `ended`) and topic (`meeting_connector_events`) must match identically between this connector repository and the LiveKit core service so the core engine can properly interpret meeting lifecycle signals.
+
+---
+
+## Running the Service
+
+### 1. Environment Configuration
+
+Copy `.env.example` to `.env` and configure credentials:
+
+```bash
+cp .env.example .env
+```
+
+Key environment variables:
+- `LIVEKIT_URL`: WebSocket URL to the core LiveKit engine (e.g. `ws://127.0.0.1:7880` or `wss://livekit.example.com`).
+- `LIVEKIT_API_KEY` & `LIVEKIT_API_SECRET`: LiveKit credentials used by the worker to connect and register.
+- `CONNECTOR_MAX_CONCURRENT_JOBS`: Maximum concurrent Google Meet browser sessions per worker (default: `1`).
+- `VOICEKIT_API_URL` & `VOICEKIT_API_KEY`: Required only if using the optional control backend adapter or testing core API dispatch.
+
+### 2. Start the Worker (MANDATORY)
+
+The worker process connects to LiveKit via WebSocket and waits for job dispatches:
 
 ```bash
 uv sync
 uv run python -m livekit.agents start agent_run.py
 ```
 
-Start the optional control backend in a second process:
+> [!IMPORTANT]
+> - **Must Remain Running**: This worker process must remain running. When VoiceKit or Wispr API triggers a meeting call, the core engine dispatches the job to this active worker over WebSocket.
+> - **Fixed Agent Name (`meet-connector`)**: The worker registers with `WorkerOptions(agent_name="meet-connector")`. The core engine explicitly dispatches to this agent name. Do not change this identifier, or dispatches will fail.
+
+### 3. Start the Control Backend (OPTIONAL)
+
+For local testing without routing through the full VoiceKit stack, run the control backend in a separate terminal:
 
 ```bash
 uv run python control_run.py
 ```
 
-Submit a meeting request:
+Submit a test meeting request:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/meetings/join \
@@ -82,25 +179,25 @@ curl -X POST http://127.0.0.1:8080/meetings/join \
   }'
 ```
 
-The control backend uses `VOICEKIT_API_URL` and `VOICEKIT_API_KEY` to call the core API. The core API key
-must be valid for the assistant owner.
+---
 
 ## Docker
 
-The worker and control backend use the same image but run as separate roles:
+The worker and control backend use the same container image:
 
 ```bash
+# MANDATORY: Start the worker to process meeting jobs
 docker compose up --build worker
+
+# OPTIONAL: Start the control backend adapter if needed
 docker compose up --build control
 ```
 
-The control backend is published on `http://127.0.0.1:8080`; its health endpoint is
-`/health`. Docker services reach LiveKit and the core API on the host through
-`host.docker.internal`. Override `DOCKER_LIVEKIT_URL` or `DOCKER_VOICEKIT_API_URL` when those
-services run at different addresses.
+The control backend is published on `http://127.0.0.1:8080` (health endpoint: `/health`).
+Docker containers reach LiveKit and the core API on the host via `host.docker.internal`.
+Override `DOCKER_LIVEKIT_URL` or `DOCKER_VOICEKIT_API_URL` if these services run at different hostnames/ports.
 
-Chrome uses Xvfb and needs the configured shared-memory allocation. Failed joins write screenshots,
-HTML, and URL artifacts under `./artifacts`.
+Chrome runs inside Xvfb and requires shared memory (`shm_size: 2gb`). Failed join diagnostics (screenshots, HTML source, and final URLs) are written to `./artifacts`.
 
 ## Project structure
 
