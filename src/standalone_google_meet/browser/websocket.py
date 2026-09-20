@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 # what the page's LiveKit adapter did with the assistant's audio track.
 BROWSER_DIAGNOSTIC_MESSAGES = frozenset(
     {
+        "BotOutputAudioLevels",
+        "LiveKitAdapterStarted",
+        "MicButtonClicked",
+        "PLAY_MEDIA_STREAM_ERROR",
         "LiveKitTrackAdded",
         "LiveKitTrackNotAccepted",
         "LiveKitConnectionFailed",
@@ -112,6 +116,10 @@ class BrowserWebSocketServer:
             # track. Without these lines a rejected track is silent on both sides, and the
             # meeting simply never hears the assistant.
             logger.info("Browser reported %s: %s", message_type, message)
+        else:
+            # Every other browser message, so a new or misspelled type is never silently
+            # dropped the way the LiveKit reports once were.
+            logger.debug("Browser reported %s: %s", message_type, message)
 
     def _bot_is_alone(self) -> bool:
         # The bot counts as a participant in Meet's own list, so one entry means

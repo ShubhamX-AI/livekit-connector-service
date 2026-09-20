@@ -432,6 +432,11 @@
 
 
   async function streamRoomSyncSourceParticipant() {
+    // First line of the only entry point into this adapter. Without it, "the adapter was
+    // never called" and "the adapter ran and failed before it could report" look identical
+    // in the connector log.
+    window.ws?.sendJson({ type: "LiveKitAdapterStarted" });
+
     const livekitConfig =
       window.initialData.roomSyncSourceParticipantConfiguration.livekit;
 

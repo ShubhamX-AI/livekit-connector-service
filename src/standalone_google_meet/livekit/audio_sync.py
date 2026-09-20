@@ -67,7 +67,7 @@ class LiveKitAudioSync:
                 "token": self._token(
                     subscriber_identity,
                     subscriber_identity,
-                    {"canPublish": False, "canSubscribe": True, "hidden": True},
+                    {"canPublish": False, "canSubscribe": True},
                 ),
                 "publish_on_behalf": self.room_name,
             }

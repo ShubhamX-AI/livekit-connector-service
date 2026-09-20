@@ -872,6 +872,15 @@ class StyleManager {
                     message: 'Failed to stream room sync source participant: ' + error.message
                 });
             });
+        } else {
+            // The guard is silent when it is false, so a missing configuration or an adapter
+            // that failed to load looks the same as a meeting with no assistant audio at all.
+            window.ws?.sendJson({
+                type: 'Error',
+                message: 'Room sync source participant not started: config=' +
+                    Boolean(window.initialData.roomSyncSourceParticipantConfiguration) +
+                    ' adapter=' + Boolean(window.streamRoomSyncSourceParticipant)
+            });
         }
     }
 
@@ -2427,26 +2436,45 @@ async function turnOnCamera() {
     }
 }
 
-function turnOnMic() {
-    // Click microphone button to turn it on
-    const microphoneButton = document.querySelector('button[aria-label="Turn on microphone"]');
+/*
+ * Google Meet renders the microphone control as a div with role="button" as often as a real
+ * <button>, and the label carries a keyboard hint in some locales. Matching only
+ * 'button[aria-label="Turn on microphone"]' therefore misses it, turnOnMic becomes a silent
+ * no-op, and the assistant's audio reaches the virtual mic while Meet stays muted. The camera
+ * helpers above already carry this workaround.
+ */
+function findMicButton(label) {
+    return (
+        document.querySelector(`button[aria-label^="${label}"]`) ||
+        document.querySelector(`div[aria-label^="${label}"]`) ||
+        document.querySelector(`[role="button"][aria-label^="${label}"]`)
+    );
+}
+
+function clickMicButton(label, caller) {
+    const microphoneButton = findMicButton(label);
+
     if (microphoneButton) {
-        console.log("Clicking the microphone button to turn it on");
+        console.log(`Clicking the microphone button: ${label}`);
         microphoneButton.click();
-    } else {
-        console.log("Microphone button not found");
+        window.ws?.sendJson({ type: 'MicButtonClicked', label: label, caller: caller });
+        return true;
     }
+
+    console.log(`Microphone button not found: ${label}`);
+    window.ws?.sendJson({
+        type: 'Error',
+        message: `Microphone button "${label}" not found in ${caller}`
+    });
+    return false;
+}
+
+function turnOnMic() {
+    clickMicButton("Turn on microphone", "turnOnMic");
 }
 
 function turnOffMic() {
-    // Click microphone button to turn it off
-    const microphoneButton = document.querySelector('button[aria-label="Turn off microphone"]');
-    if (microphoneButton) {
-        console.log("Clicking the microphone button to turn it off");
-        microphoneButton.click();
-    } else {
-        console.log("Microphone off button not found");
-    }
+    clickMicButton("Turn off microphone", "turnOffMic");
 }
 
 function turnOnMicAndCamera() {

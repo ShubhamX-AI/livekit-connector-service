@@ -437,6 +437,8 @@ class BotVideoOutputStream {
             this.mediaStreamAudioSource.connect(this.getGainNode());
             ///----
 
+            this._startBotOutputLevelProbe(mediaStream);
+
             if (this.getAudioContext().state === "suspended") {
                 await this.getAudioContext().resume();
             }
@@ -455,7 +457,64 @@ class BotVideoOutputStream {
         }
     }
 
+    /*
+     * Reports the peak sample at two points on the assistant's audio path, about once a
+     * second: the MediaStreamAudioSourceNode fed by the LiveKit track, and the gainNode that
+     * feeds the virtual microphone. A silent source with a live LiveKit track means the audio
+     * never reaches WebAudio; a live source with a silent meeting means the fault is after the
+     * gainNode. Without both numbers the two are indistinguishable from the connector log.
+     */
+    _startBotOutputLevelProbe(mediaStream) {
+        this._stopBotOutputLevelProbe();
+
+        const audioContext = this.getAudioContext();
+        const sourceAnalyser = audioContext.createAnalyser();
+        const gainAnalyser = audioContext.createAnalyser();
+
+        sourceAnalyser.fftSize = 2048;
+        gainAnalyser.fftSize = 2048;
+
+        this.mediaStreamAudioSource.connect(sourceAnalyser);
+        this.getGainNode().connect(gainAnalyser);
+
+        const sourceSamples = new Float32Array(sourceAnalyser.fftSize);
+        const gainSamples = new Float32Array(gainAnalyser.fftSize);
+
+        const peak = (analyser, samples) => {
+            analyser.getFloatTimeDomainData(samples);
+            let highest = 0;
+            for (const sample of samples) {
+                const magnitude = Math.abs(sample);
+                if (magnitude > highest) {
+                    highest = magnitude;
+                }
+            }
+            return Math.round(highest * 32767);
+        };
+
+        this.botOutputLevelProbeInterval = setInterval(() => {
+            const audioTrack = mediaStream.getAudioTracks()[0];
+            window.ws?.sendJson({
+                type: 'BotOutputAudioLevels',
+                sourcePeak: peak(sourceAnalyser, sourceSamples),
+                gainPeak: peak(gainAnalyser, gainSamples),
+                audioContextState: audioContext.state,
+                trackReadyState: audioTrack?.readyState ?? null,
+                trackMuted: audioTrack?.muted ?? null,
+                trackEnabled: audioTrack?.enabled ?? null,
+            });
+        }, 1000);
+    }
+
+    _stopBotOutputLevelProbe() {
+        if (this.botOutputLevelProbeInterval) {
+            clearInterval(this.botOutputLevelProbeInterval);
+            this.botOutputLevelProbeInterval = null;
+        }
+    }
+
     async stopMediaStream() {
+        this._stopBotOutputLevelProbe();
         this._stopVideoPlayback();
         
         // If we had an image, display it again keep the input on if not turn it off
