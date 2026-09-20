@@ -1,0 +1,193 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>LiveKit adapter audio mixing harness</title>
+<body>
+<script>
+  /*
+   * Harness for the LiveKit adapter's audio path.
+   *
+   * The agent participant publishes two audio tracks at once (speech and a
+   * background/ambience bed). This page publishes two pure tones in their place,
+   * runs the real adapter, and checks that both tones survive all the way to the
+   * stream the adapter hands to the bot's webcam output.
+   *
+   * The tones are deliberately non-harmonic so that harmonic distortion of one
+   * cannot be mistaken for the presence of the other.
+   */
+  const TONE_A_HZ = 400;
+  const TONE_B_HZ = 1500;
+
+  const toneContext = new AudioContext();
+
+  function toneTrack(frequencyHz) {
+    const oscillator = toneContext.createOscillator();
+    const destination = toneContext.createMediaStreamDestination();
+
+    oscillator.frequency.value = frequencyHz;
+    oscillator.connect(destination);
+    oscillator.start();
+
+    return destination.stream.getAudioTracks()[0];
+  }
+
+  function blankVideoTrack() {
+    const canvas = document.createElement("canvas");
+    canvas.width = 320;
+    canvas.height = 240;
+    canvas.getContext("2d").fillRect(0, 0, 320, 240);
+    return canvas.captureStream(5).getVideoTracks()[0];
+  }
+
+  function publication(mediaStreamTrack, sid) {
+    return {
+      trackSid: sid,
+      kind: mediaStreamTrack.kind,
+      source: mediaStreamTrack.kind === "audio" ? "microphone" : "camera",
+      isMuted: false,
+      isSubscribed: true,
+      track: { mediaStreamTrack: mediaStreamTrack },
+    };
+  }
+
+  // Minimal stand-in for the LiveKit SDK: a room that is already carrying the
+  // agent's publications by the time connect() resolves.
+  const participant = {
+    identity: "agent",
+    sid: "PA_agent",
+    name: "agent",
+    metadata: null,
+    attributes: { "lk.publish_on_behalf": "candidate-1" },
+    isLocal: false,
+    trackPublications: new Map([
+      ["voice", publication(toneTrack(TONE_A_HZ), "voice")],
+      ["background", publication(toneTrack(TONE_B_HZ), "background")],
+      ["camera", publication(blankVideoTrack(), "camera")],
+    ]),
+  };
+
+  window.LivekitClient = {
+    RoomEvent: {
+      TrackSubscribed: "trackSubscribed",
+      TrackUnsubscribed: "trackUnsubscribed",
+      TrackMuted: "trackMuted",
+      TrackUnmuted: "trackUnmuted",
+      Disconnected: "disconnected",
+    },
+    Room: class {
+      constructor() {
+        this.name = "harness-room";
+        this.localParticipant = null;
+        this.remoteParticipants = new Map([[participant.identity, participant]]);
+      }
+      on() {}
+      async connect() {}
+      async disconnect() {}
+    },
+  };
+
+  // Stand-ins for the parts of the Google Meet payload the adapter talks to.
+  const sentMessages = [];
+  window.ws = { sendJson: (payload) => sentMessages.push(payload) };
+
+  let capturedStream = null;
+  window.botOutputManager = {
+    setBotOutputMediaStream: (stream) => {
+      capturedStream = stream;
+    },
+    playBotOutputMediaStream: async () => {},
+    ensureMicOn: () => {},
+    disableMic: () => {},
+  };
+
+  window.initialData = {
+    websocketPort: 0,
+    roomSyncSourceParticipantConfiguration: {
+      livekit: {
+        token: "harness-token",
+        publish_on_behalf: "candidate-1",
+      },
+    },
+  };
+
+  // Peak magnitude in dB inside a narrow window around the target frequency.
+  function peakNear(frequencies, sampleRate, fftSize, targetHz) {
+    const binHz = sampleRate / fftSize;
+    const first = Math.max(0, Math.floor((targetHz - 20) / binHz));
+    const last = Math.min(frequencies.length - 1, Math.ceil((targetHz + 20) / binHz));
+
+    let highest = -Infinity;
+    for (let bin = first; bin <= last; bin += 1) {
+      highest = Math.max(highest, frequencies[bin]);
+    }
+    return highest;
+  }
+
+  async function measure(audioTrack) {
+    const context = new AudioContext();
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 8192;
+
+    context
+      .createMediaStreamSource(new MediaStream([audioTrack]))
+      .connect(analyser);
+
+    await context.resume();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    const frequencies = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(frequencies);
+
+    return {
+      toneA: peakNear(frequencies, context.sampleRate, analyser.fftSize, TONE_A_HZ),
+      toneB: peakNear(frequencies, context.sampleRate, analyser.fftSize, TONE_B_HZ),
+    };
+  }
+
+  async function run() {
+    await toneContext.resume();
+    await window.streamRoomSyncSourceParticipant();
+
+    if (!capturedStream) {
+      throw new Error("adapter never called setBotOutputMediaStream");
+    }
+
+    const audioTracks = capturedStream.getAudioTracks();
+
+    if (audioTracks.length !== 1) {
+      throw new Error(
+        `expected exactly one mixed audio track, got ${audioTracks.length}`
+      );
+    }
+
+    const peaks = await measure(audioTracks[0]);
+
+    // A tone that is actually present sits far above this; a tone that was
+    // dropped leaves the bin at the analyser's floor (about -100 dB).
+    const AUDIBLE_DB = -60;
+
+    return {
+      passed: peaks.toneA > AUDIBLE_DB && peaks.toneB > AUDIBLE_DB,
+      toneAHz: TONE_A_HZ,
+      toneBHz: TONE_B_HZ,
+      toneADb: peaks.toneA,
+      toneBDb: peaks.toneB,
+      audioTrackCount: audioTracks.length,
+    };
+  }
+
+  function report(result) {
+    navigator.sendBeacon("/result", JSON.stringify(result));
+  }
+
+  window.runHarness = () =>
+    run()
+      .then(report)
+      .catch((error) => report({ passed: false, error: String(error) }));
+</script>
+
+<!-- The adapter is loaded after its stubs and before the run, exactly as the
+     payload loads it in the browser. It is the real file, never a copy. -->
+<script src="/src/standalone_google_meet/browser/assets/livekit-client-adapter.js"></script>
+<script>
+  window.runHarness();
+</script>

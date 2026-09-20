@@ -46,8 +46,14 @@
         this.selectedParticipantIdentity = null;
         this.matchParticipantOnPublishOnBehalf = matchParticipantOnPublishOnBehalf;
   
-        // The output contains at most one audio and one video track.
+        // The output contains at most one video track and exactly one audio
+        // track: every remote audio track is summed into that one.
         this.outputTrackByKind = new Map();
+
+        // Web Audio mixing state, created when the first audio track arrives.
+        this.audioContext = null;
+        this.audioDestination = null;
+        this.audioSourceByTrackId = new Map();
   
         this.trackEvents = new EventTarget();
   
@@ -81,11 +87,32 @@
         return;
       }
 
-      if (muted) {
-        window.botOutputManager?.disableMic();
-      } else {
+      if (!muted) {
         window.botOutputManager?.ensureMicOn();
+        return;
       }
+
+      // The participant can publish several audio tracks at once, so the
+      // microphone may only be silenced once every one of them is muted.
+      if (!this.hasUnmutedRemoteAudio()) {
+        window.botOutputManager?.disableMic();
+      }
+    }
+
+    hasUnmutedRemoteAudio() {
+      for (const participant of this.room.remoteParticipants.values()) {
+        if (!this.acceptsParticipant(participant)) {
+          continue;
+        }
+
+        for (const publication of participant.trackPublications.values()) {
+          if (publication.kind === "audio" && !publication.isMuted) {
+            return true;
+          }
+        }
+      }
+
+      return false;
     }
   
       /*
@@ -143,19 +170,27 @@
           return;
         }
   
-        const previousTrack = this.outputTrackByKind.get(mediaTrack.kind);
-  
-        if (previousTrack === mediaTrack) {
-          return;
+        if (mediaTrack.kind === "audio") {
+          if (this.audioSourceByTrackId.has(mediaTrack.id)) {
+            return;
+          }
+
+          this.mixAudioTrack(mediaTrack);
+        } else {
+          const previousTrack = this.outputTrackByKind.get(mediaTrack.kind);
+
+          if (previousTrack === mediaTrack) {
+            return;
+          }
+
+          // Replace the previous video track.
+          if (previousTrack) {
+            this.stream.removeTrack(previousTrack);
+          }
+
+          this.outputTrackByKind.set(mediaTrack.kind, mediaTrack);
+          this.stream.addTrack(mediaTrack);
         }
-  
-        // Replace the previous track of the same kind.
-        if (previousTrack) {
-          this.stream.removeTrack(previousTrack);
-        }
-  
-        this.outputTrackByKind.set(mediaTrack.kind, mediaTrack);
-        this.stream.addTrack(mediaTrack);
   
         console.info("[LiveKit receiver] Added track", {
           participantIdentity: participant.identity,
@@ -175,6 +210,43 @@
         this.notifyTrackChange();
       }
   
+      /*
+       * Sums every remote audio track into one mixed track. The consumer builds a
+       * single MediaStreamAudioSourceNode from this stream, and such a node reads
+       * only one track from it, so parallel audio tracks would leave all but one
+       * inaudible. The participant publishes its speech and its background audio
+       * separately, and both have to reach the meeting.
+       */
+      mixAudioTrack(mediaTrack) {
+        if (!this.audioContext) {
+          this.audioContext = new AudioContext();
+          this.audioDestination = this.audioContext.createMediaStreamDestination();
+
+          // The context can start suspended; nothing here depends on the result.
+          this.audioContext.resume().catch(() => {});
+
+          const mixedTrack = this.audioDestination.stream.getAudioTracks()[0];
+          this.outputTrackByKind.set("audio", mixedTrack);
+          this.stream.addTrack(mixedTrack);
+        }
+
+        const source = this.audioContext.createMediaStreamSource(
+          new MediaStream([mediaTrack])
+        );
+
+        source.connect(this.audioDestination);
+        this.audioSourceByTrackId.set(mediaTrack.id, source);
+      }
+
+      unmixAudioTrack(mediaTrack) {
+        const source = this.audioSourceByTrackId.get(mediaTrack.id);
+
+        if (source) {
+          source.disconnect();
+          this.audioSourceByTrackId.delete(mediaTrack.id);
+        }
+      }
+
       removeRemoteTrack(remoteTrack, publication, participant) {
         const mediaTrack = remoteTrack.mediaStreamTrack;
   
@@ -182,7 +254,10 @@
           return;
         }
   
-        if (this.outputTrackByKind.get(mediaTrack.kind) === mediaTrack) {
+        if (mediaTrack.kind === "audio") {
+          // The mixed track stays in the stream; only this input leaves the mix.
+          this.unmixAudioTrack(mediaTrack);
+        } else if (this.outputTrackByKind.get(mediaTrack.kind) === mediaTrack) {
           this.outputTrackByKind.delete(mediaTrack.kind);
           this.stream.removeTrack(mediaTrack);
           this.notifyTrackChange();
@@ -291,6 +366,18 @@
         // MediaStreamTrack.stop(). LiveKit owns the remote tracks.
         for (const track of this.stream.getTracks()) {
           this.stream.removeTrack(track);
+        }
+
+        for (const source of this.audioSourceByTrackId.values()) {
+          source.disconnect();
+        }
+
+        this.audioSourceByTrackId.clear();
+
+        if (this.audioContext) {
+          await this.audioContext.close().catch(() => {});
+          this.audioContext = null;
+          this.audioDestination = null;
         }
   
         try {

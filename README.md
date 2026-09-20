@@ -84,9 +84,19 @@ Google Meet mixed audio
     -> one mixed LiveKit audio track
     -> api-agent STT/LLM/TTS
     -> assistant LiveKit audio selected by lk.publish_on_behalf
+       (every audio track of that participant: speech, background, fillers)
     -> browser LiveKit relay
+    -> Web Audio mix down to one track
     -> Google Meet virtual microphone
 ```
+
+The assistant participant may publish more than one audio track at a time, for
+example speech alongside a background bed. The browser relay
+(`src/standalone_google_meet/browser/assets/livekit-client-adapter.js`) sums them
+in Web Audio into a single track before handing the stream to the virtual
+microphone. The merge is required, not cosmetic: the consumer builds one
+`MediaStreamAudioSourceNode` from that stream, and such a node reads only one
+track, so without the mix all but one audio track would be silent in the meeting.
 
 ### Meeting Lifecycle Events & Core Synchronization
 
@@ -229,6 +239,10 @@ Chrome runs inside Xvfb and requires shared memory (`shm_size: 2gb`). Failed joi
 │   ├── config.py                        # Deployment and job metadata configuration
 │   └── events.py                        # Shared meeting connector events
 ├── tests/                               # Unit tests at the module seams
+│   ├── test_connector.py                # Worker, transport, and lifecycle seams
+│   └── browser/                         # Headless-Chrome checks for injected scripts
+│       ├── mix-audio.html               # Two-tone audio mixing harness
+│       └── run_mix_audio.py             # Harness runner and verdict
 ├── Dockerfile
 ├── docker-compose.yaml
 ├── .env.example
@@ -249,8 +263,14 @@ from standalone_google_meet.livekit.worker import entrypoint
 ```bash
 uv run python -m unittest discover -s tests -p 'test_*.py' -v
 uv run ruff check src tests agent_run.py control_run.py
+uv run python tests/browser/run_mix_audio.py
 docker build .
 ```
+
+`run_mix_audio.py` drives the real LiveKit adapter in headless Chrome against a
+stubbed LiveKit SDK that publishes two tones at once, and fails if either tone is
+missing from the mixed output. It needs a Chrome or Chromium binary; set
+`CHROME_BINARY` if it is not on the usual paths.
 
 Real integration verification requires a running core API, LiveKit server, `api-agent` worker,
 and a Google Meet that permits the bot to join.
